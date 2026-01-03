@@ -4,7 +4,6 @@ import os
 from dotenv import load_dotenv
 import threading
 import queue
-from deepdub import DeepdubClient
 import uvicorn
 import subprocess
 import json
@@ -14,7 +13,7 @@ import time
 import base64
 import binascii
 from typing import Optional
-import websockets
+from deepdub_ws_manager import DeepdubWebsocketManager
 from pathlib import Path
 
 
@@ -53,6 +52,9 @@ def ffmpeg_wav_or_mp3_to_pcm16k(blob: bytes) -> bytes:
 def looks_like_wav(b: bytes) -> bool:
     return len(b) >= 12 and b[0:4] == b"RIFF" and b[8:12] == b"WAVE"
 
+
+ws_manager = DeepdubWebsocketManager(DEEPDUB_WS_URL, deepdub_api_key)
+
 @app.post("/to-speech")
 async def to_speech(request: Request):
     t0 = time.perf_counter()
@@ -71,63 +73,50 @@ async def to_speech(request: Request):
         total_pcm = 0
         first = True
 
+        req = {
+            "action": "text-to-speech",
+            "locale": "he-IL",
+            "voicePromptId": "cd91dbf2-7265-420b-b8fd-9b90f2555d02_prompt-reading-neutral",
+            "model": "dd-etts-3.0-preview",
+            "targetText": text,
+            "cleanAudio": True,
+            "realTime": True
+        }
+
+        print(f"\n📨 /to-speech | text_len={len(text)}")
+
+        async def handle_message(msgj: dict) -> None:
+            nonlocal ws_chunks, total_decoded, total_pcm, first
+            ws_chunks += 1
+            idx = msgj.get("index")
+            gid = msgj.get("generationId")
+            is_finished = bool(msgj.get("isFinished"))
+            b64 = msgj.get("data")
+
+            print(f"📦 WS chunk | gid={gid} idx={idx} finished={is_finished} has_data={bool(b64)}")
+
+            if b64:
+                audio_bytes = base64.b64decode(b64)
+                total_decoded += len(audio_bytes)
+
+                if first:
+                    ttfa = (time.perf_counter() - t0) * 1000
+                    print(f"⚡ TTFA={ttfa:.1f}ms | first_size={len(audio_bytes)} bytes")
+                    print("🔎 ascii4:", audio_bytes[:4])
+                    print("🔎 first16(hex):", binascii.hexlify(audio_bytes[:16]).decode())
+                    first = False
+
+                if looks_like_wav(audio_bytes):
+                    pcm = await asyncio.to_thread(ffmpeg_wav_or_mp3_to_pcm16k, audio_bytes)
+                    total_pcm += len(pcm)
+                    await q.put(pcm)
+                else:
+                    print("⚠️ chunk not WAV; skipping (or handle separately)")
+
         try:
-            async with websockets.connect(
-                DEEPDUB_WS_URL,
-                additional_headers={"x-api-key": deepdub_api_key},
-                ping_interval=20,
-                ping_timeout=20,
-                max_size=None,
-            ) as ws:
-                req = {
-                    "action": "text-to-speech",
-                    "locale": "he-IL",
-                    "voicePromptId": "cd91dbf2-7265-420b-b8fd-9b90f2555d02_prompt-reading-neutral",
-                    "model": "dd-etts-3.0-preview",
-                    "targetText": text,
-                    "cleanAudio": True,
-                    "realTime": True
-                }
-
-                print(f"\n📨 /to-speech | text_len={len(text)}")
-                await ws.send(json.dumps(req))
-
-                while True:
-                    raw_msg = await ws.recv()
-                    msgj = json.loads(raw_msg)
-
-                    ws_chunks += 1
-                    idx = msgj.get("index")
-                    gid = msgj.get("generationId")
-                    is_finished = bool(msgj.get("isFinished"))
-                    b64 = msgj.get("data")
-
-                    print(f"📦 WS chunk | gid={gid} idx={idx} finished={is_finished} has_data={bool(b64)}")
-
-                    if b64:
-                        audio_bytes = base64.b64decode(b64)
-                        total_decoded += len(audio_bytes)
-
-                        if first:
-                            ttfa = (time.perf_counter() - t0) * 1000
-                            print(f"⚡ TTFA={ttfa:.1f}ms | first_size={len(audio_bytes)} bytes")
-                            print("🔎 ascii4:", audio_bytes[:4])
-                            print("🔎 first16(hex):", binascii.hexlify(audio_bytes[:16]).decode())
-                            first = False
-
-                        if looks_like_wav(audio_bytes):
-                            pcm = await asyncio.to_thread(ffmpeg_wav_or_mp3_to_pcm16k, audio_bytes)
-                            total_pcm += len(pcm)
-                            await q.put(pcm)
-                        else:
-                            print("⚠️ chunk not WAV; skipping (or handle separately)")
-
-                    if is_finished:
-                        break
-
+            await ws_manager.run_tts(req, handle_message)
             t_total = (time.perf_counter() - t0) * 1000
             print(f"🏁 WS done | chunks={ws_chunks} decoded={total_decoded} pcm={total_pcm} total_time={t_total:.1f}ms")
-
         except Exception as e:
             print(f"❌ producer error: {e}")
         finally:
